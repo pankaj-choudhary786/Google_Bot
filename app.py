@@ -10,8 +10,47 @@ app = Flask(__name__)
 # --- CONFIGURATION ---
 API_KEY = os.environ.get("GOOGLE_API_KEY")
 
-if API_KEY:
+# --- AUTO-DETECT MODEL FUNCTION ---
+def get_best_model():
+    """
+    Automatically finds a working model name from your API account.
+    Prioritizes: Flash -> Pro -> Any available model.
+    """
+    if not API_KEY: return None
+    
     genai.configure(api_key=API_KEY)
+    
+    print("-> Checking available models...")
+    try:
+        available_models = []
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                available_models.append(m.name)
+        
+        print(f"-> Found models: {available_models}")
+        
+        # Priority 1: Look for any "flash" model (fastest/cheapest)
+        for m in available_models:
+            if "flash" in m.lower() and "legacy" not in m.lower():
+                print(f"-> Auto-selected model: {m}")
+                return m
+                
+        # Priority 2: Look for any "pro" model
+        for m in available_models:
+            if "pro" in m.lower() and "vision" not in m.lower() and "legacy" not in m.lower():
+                print(f"-> Auto-selected model: {m}")
+                return m
+
+        # Priority 3: First available model
+        if available_models:
+            print(f"-> Auto-selected model: {available_models[0]}")
+            return available_models[0]
+            
+    except Exception as e:
+        print(f"-> Error listing models: {e}")
+    
+    # Fallback if detection fails
+    return "models/gemini-1.5-flash"
 
 # --- HELPER FUNCTIONS ---
 def download_youtube_video(url, output_path):
@@ -58,6 +97,7 @@ def process_video():
 
         # 2. UPLOAD
         print("-> Uploading to Gemini...")
+        genai.configure(api_key=API_KEY)
         video_file = genai.upload_file(path=local_path)
         
         print("-> Waiting for processing...")
@@ -69,9 +109,9 @@ def process_video():
             raise ValueError(f"Video processing failed: {video_file.state.name}")
 
         # 3. GENERATE
-        print("-> Generating transcript...")
-        
-        model = genai.GenerativeModel(model_name="gemini-1.5-flash")
+        print("-> Selecting best model...")
+        model_name = get_best_model()
+        model = genai.GenerativeModel(model_name=model_name)
         
         # --- YOUR CUSTOM PROMPT ---
         prompt = (
@@ -85,21 +125,12 @@ def process_video():
         
         return jsonify({
             "status": "success",
+            "model_used": model_name,
             "transcript": response.text
         })
 
     except Exception as e:
         print(f"Error: {e}")
-        # Debugging: Print available models if generate fails
-        try:
-            print("--- LIST OF AVAILABLE MODELS ---")
-            for m in genai.list_models():
-                if 'generateContent' in m.supported_generation_methods:
-                    print(m.name)
-            print("--------------------------------")
-        except:
-            pass
-            
         return jsonify({"error": str(e)}), 500
         
     finally:
