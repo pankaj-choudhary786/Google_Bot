@@ -1,5 +1,5 @@
 flask
-selenium
-webdriver-manager
 requests
 gunicorn
+google-generativeai
+yt-dlp
