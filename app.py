@@ -65,7 +65,7 @@ def background_worker(job_id, video_url):
         model = genai.GenerativeModel(model_name=get_model())
         
         prompt = (
-            "generate a frame by frame and per second transcript of this video . "
+            "generate a frame by frame and per second detailed transcript of this video . "
             "Show all expressions and every frame in the transcript with timestampts "
             "of the per second transcript. if any dialouge is there in the video "
             "speak by characters in the video then also add that in the transcript."
@@ -123,3 +123,4 @@ def get_result(job_id):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
+
