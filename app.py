@@ -11,41 +11,38 @@ app = Flask(__name__)
 
 # --- CONFIGURATION ---
 API_KEY = os.environ.get("GOOGLE_API_KEY")
+COOKIES_FILE = "/etc/secrets/youtube_cookies.txt" # Render stores secret files here
 
 # GLOBAL STORAGE
 JOBS = {} 
 
-# --- HELPER: AUTO-SELECT MODEL (Silent) ---
-def get_model_name():
+# --- HELPER: SILENT MODEL SELECTOR ---
+def get_model():
     if not API_KEY: return "models/gemini-1.5-flash"
     genai.configure(api_key=API_KEY)
     try:
+        # Silently pick the best available model without showing output
         available = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        # Prioritize Flash
         for m in available:
             if "flash" in m.lower() and "legacy" not in m.lower(): return m
-        # Fallback to Pro
-        for m in available:
-            if "pro" in m.lower() and "vision" not in m.lower(): return m
-        return available[0] if available else "models/gemini-1.5-flash"
+        return available[0]
     except:
         return "models/gemini-1.5-flash"
 
-# --- HELPER: DOWNLOADERS (Fixed for YouTube) ---
+# --- HELPER: DOWNLOADERS ---
 def download_youtube_video(url, output_path):
-    # We use the 'android' client to bypass the "Sign in to confirm you're not a bot" error
+    # Check if cookies exist
+    if not os.path.exists(COOKIES_FILE):
+        print("WARNING: Cookie file not found. YouTube download may fail.")
+
     ydl_opts = {
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': output_path,
         'quiet': True,
         'no_warnings': True,
         'merge_output_format': 'mp4',
+        'cookiefile': COOKIES_FILE, # <--- THIS FIXES THE ERROR
         'nocheckcertificate': True,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android', 'web']
-            }
-        }
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
@@ -84,8 +81,7 @@ def background_worker(job_id, video_url):
             raise ValueError("Processing failed")
 
         # 4. Generate
-        model_name = get_model_name()
-        model = genai.GenerativeModel(model_name=model_name)
+        model = genai.GenerativeModel(model_name=get_model())
         
         prompt = (
             "generate a frame by frame and per second transcript of this video . "
@@ -102,7 +98,11 @@ def background_worker(job_id, video_url):
 
     except Exception as e:
         JOBS[job_id]["status"] = "failed"
-        JOBS[job_id]["error"] = str(e)
+        # Simplify error message for user
+        error_msg = str(e)
+        if "Sign in" in error_msg:
+            error_msg = "YouTube Login Error: Please update youtube_cookies.txt in Render."
+        JOBS[job_id]["error"] = error_msg
         
     finally:
         if os.path.exists(local_path):
@@ -123,7 +123,7 @@ def start_job():
     thread.daemon = True
     thread.start()
     
-    # Minimal response
+    # CLEAN OUTPUT
     return jsonify({
         "status": "started",
         "id": job_id
@@ -135,10 +135,12 @@ def get_result(job_id):
     if not job:
         return jsonify({"error": "Not found"}), 404
     
-    # Minimal response
+    # CLEAN OUTPUT (Only show what matters)
     response = {"status": job["status"]}
+    
     if "transcript" in job:
         response["transcript"] = job["transcript"]
+    
     if "error" in job:
         response["error"] = job["error"]
         
