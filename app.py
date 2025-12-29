@@ -12,7 +12,6 @@ app = Flask(__name__)
 
 # --- CONFIGURATION ---
 API_KEY = os.environ.get("GOOGLE_API_KEY")
-# The Read-Only source file from Render
 COOKIES_SOURCE = "/etc/secrets/youtube_cookies.txt" 
 
 # GLOBAL STORAGE
@@ -32,14 +31,21 @@ def get_model():
 
 # --- HELPER: DOWNLOADERS ---
 def download_youtube_video(url, output_path, cookie_path):
+    # 'ios' client is often less strict about "Sign in" checks
     ydl_opts = {
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': output_path,
         'quiet': True,
         'no_warnings': True,
         'merge_output_format': 'mp4',
-        'cookiefile': cookie_path,  # Use the WRITABLE copy
+        'cookiefile': cookie_path,
         'nocheckcertificate': True,
+        'source_address': '0.0.0.0', # Force IPv4
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['ios', 'web_creator'] # Mimic iPhone or Creator Studio
+            }
+        }
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
@@ -54,27 +60,30 @@ def download_cloud_file(url, output_path):
 # --- BACKGROUND WORKER ---
 def background_worker(job_id, video_url):
     local_video_path = f"temp_{job_id}.mp4"
-    local_cookie_path = f"cookies_{job_id}.txt" # Unique writable cookie file
+    local_cookie_path = f"cookies_{job_id}.txt"
     
     JOBS[job_id]["status"] = "working"
     
     try:
         if not API_KEY: raise ValueError("Server configuration error")
 
-        # 1. Setup Cookies (Copy from Read-Only to Writable)
+        # 1. Setup Cookies (Copy to writable location)
         use_cookies = False
         if os.path.exists(COOKIES_SOURCE):
             try:
                 shutil.copy(COOKIES_SOURCE, local_cookie_path)
                 use_cookies = True
-            except Exception as e:
-                print(f"Cookie copy failed: {e}")
+            except:
+                pass
 
         # 2. Download
         if "youtube.com" in video_url or "youtu.be" in video_url:
-            if not use_cookies:
-                raise ValueError("YouTube cookies missing on server")
-            download_youtube_video(video_url, local_video_path, local_cookie_path)
+            # We try to download. If cookies are missing, we try anyway (might work for some vids)
+            cookie_arg = local_cookie_path if use_cookies else None
+            if not cookie_arg:
+                print("Note: No cookies found. Attempting cookie-less download.")
+            
+            download_youtube_video(video_url, local_video_path, cookie_arg)
         else:
             download_cloud_file(video_url, local_video_path)
             
@@ -111,7 +120,6 @@ def background_worker(job_id, video_url):
         JOBS[job_id]["error"] = str(e)
         
     finally:
-        # Cleanup ALL temp files
         if os.path.exists(local_video_path):
             try: os.remove(local_video_path)
             except: pass
