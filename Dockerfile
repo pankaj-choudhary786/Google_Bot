@@ -1,21 +1,30 @@
 # Use Python base image
 FROM python:3.9-slim
 
-# Install Chrome and system tools
+# 1. Install dependencies for downloading and SSL
 RUN apt-get update && apt-get install -y \
     wget \
-    gnupg \
+    ca-certificates \
     unzip \
-    && wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
-    && sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list' \
-    && apt-get update \
-    && apt-get install -y google-chrome-stable \
+    curl \
+    gnupg \
     && apt-get clean
 
-# Set up app
+# 2. Download and Install Google Chrome (The Stable Way)
+# We download the .deb file directly and let apt handle the dependencies
+RUN wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+    && apt-get install -y ./google-chrome-stable_current_amd64.deb \
+    && rm google-chrome-stable_current_amd64.deb \
+    && apt-get clean
+
+# 3. Set working directory
 WORKDIR /app
+
+# 4. Copy files
 COPY . .
+
+# 5. Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Start the server using Gunicorn
-CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:10000", "--timeout", "600"]
+# 6. Start the server
+CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:10000", "--timeout", "300"]
