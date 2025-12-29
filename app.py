@@ -1,5 +1,7 @@
 import os
 import time
+import uuid
+import threading
 import requests
 import google.generativeai as genai
 import yt_dlp
@@ -10,51 +12,28 @@ app = Flask(__name__)
 # --- CONFIGURATION ---
 API_KEY = os.environ.get("GOOGLE_API_KEY")
 
-# --- AUTO-DETECT MODEL FUNCTION ---
+# GLOBAL STORAGE (In-Memory Database)
+# Warning: If server restarts, these jobs disappear.
+JOBS = {} 
+
+# --- HELPER: AUTO-DETECT MODEL ---
 def get_best_model():
-    """
-    Automatically finds a working model name from your API account.
-    Prioritizes: Flash -> Pro -> Any available model.
-    """
     if not API_KEY: return None
-    
     genai.configure(api_key=API_KEY)
-    
-    print("-> Checking available models...")
     try:
-        available_models = []
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                available_models.append(m.name)
-        
-        print(f"-> Found models: {available_models}")
-        
-        # Priority 1: Look for any "flash" model (fastest/cheapest)
-        for m in available_models:
-            if "flash" in m.lower() and "legacy" not in m.lower():
-                print(f"-> Auto-selected model: {m}")
-                return m
-                
-        # Priority 2: Look for any "pro" model
-        for m in available_models:
-            if "pro" in m.lower() and "vision" not in m.lower() and "legacy" not in m.lower():
-                print(f"-> Auto-selected model: {m}")
-                return m
+        # Prioritize Flash -> Pro -> Any
+        available = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        for m in available:
+            if "flash" in m.lower() and "legacy" not in m.lower(): return m
+        for m in available:
+            if "pro" in m.lower() and "vision" not in m.lower(): return m
+        return available[0] if available else "models/gemini-1.5-flash"
+    except:
+        return "models/gemini-1.5-flash"
 
-        # Priority 3: First available model
-        if available_models:
-            print(f"-> Auto-selected model: {available_models[0]}")
-            return available_models[0]
-            
-    except Exception as e:
-        print(f"-> Error listing models: {e}")
-    
-    # Fallback if detection fails
-    return "models/gemini-1.5-flash"
-
-# --- HELPER FUNCTIONS ---
+# --- HELPER: DOWNLOADERS ---
 def download_youtube_video(url, output_path):
-    print(f"-> Detected YouTube URL. Extracting...")
+    print(f"-> Extracting YouTube: {url}")
     ydl_opts = {
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': output_path,
@@ -66,54 +45,45 @@ def download_youtube_video(url, output_path):
         ydl.download([url])
 
 def download_cloud_file(url, output_path):
-    print(f"-> Detected Cloud URL. Downloading...")
+    print(f"-> Downloading Cloud File: {url}")
     with requests.get(url, stream=True) as r:
         r.raise_for_status()
         with open(output_path, 'wb') as f:
             for chunk in r.iter_content(chunk_size=8192):
                 f.write(chunk)
 
-# --- MAIN ROUTE ---
-@app.route('/process', methods=['POST'])
-def process_video():
-    data = request.json
-    if not data or 'url' not in data:
-        return jsonify({"error": "No url provided"}), 400
-    
-    video_url = data['url']
-    local_filename = f"temp_{int(time.time())}.mp4"
-    local_path = os.path.join(os.getcwd(), local_filename)
+# --- BACKGROUND WORKER ---
+def background_worker(job_id, video_url):
+    local_path = f"temp_{job_id}.mp4"
+    JOBS[job_id]["status"] = "processing"
     
     try:
-        if not API_KEY:
-            return jsonify({"error": "Server API Key is missing."}), 500
+        if not API_KEY: raise ValueError("API Key missing")
 
-        # 1. DOWNLOAD
+        # 1. Download
         if "youtube.com" in video_url or "youtu.be" in video_url:
             download_youtube_video(video_url, local_path)
         else:
             download_cloud_file(video_url, local_path)
-        print("-> Download complete.")
-
-        # 2. UPLOAD
-        print("-> Uploading to Gemini...")
+            
+        # 2. Upload
         genai.configure(api_key=API_KEY)
+        print(f"[{job_id}] Uploading to Gemini...")
         video_file = genai.upload_file(path=local_path)
         
-        print("-> Waiting for processing...")
+        # 3. Wait for Processing
         while video_file.state.name == "PROCESSING":
             time.sleep(2)
             video_file = genai.get_file(video_file.name)
             
         if video_file.state.name == "FAILED":
-            raise ValueError(f"Video processing failed: {video_file.state.name}")
+            raise ValueError(f"Google processing failed: {video_file.state.name}")
 
-        # 3. GENERATE
-        print("-> Selecting best model...")
+        # 4. Generate
+        print(f"[{job_id}] Generating transcript...")
         model_name = get_best_model()
         model = genai.GenerativeModel(model_name=model_name)
         
-        # --- YOUR CUSTOM PROMPT ---
         prompt = (
             "generate a frame by frame and per second transcript of this video . "
             "Show all expressions and every frame in the transcript with timestampts "
@@ -123,20 +93,52 @@ def process_video():
         
         response = model.generate_content([video_file, prompt])
         
-        return jsonify({
-            "status": "success",
-            "model_used": model_name,
-            "transcript": response.text
-        })
+        # 5. Success
+        JOBS[job_id]["status"] = "completed"
+        JOBS[job_id]["transcript"] = response.text
+        JOBS[job_id]["model_used"] = model_name
+        print(f"[{job_id}] DONE!")
 
     except Exception as e:
-        print(f"Error: {e}")
-        return jsonify({"error": str(e)}), 500
+        print(f"[{job_id}] ERROR: {e}")
+        JOBS[job_id]["status"] = "failed"
+        JOBS[job_id]["error"] = str(e)
         
     finally:
+        # Cleanup
         if os.path.exists(local_path):
             try: os.remove(local_path)
             except: pass
+
+# --- ENDPOINTS ---
+@app.route('/process', methods=['POST'])
+def start_job():
+    data = request.json
+    if not data or 'url' not in data:
+        return jsonify({"error": "No url provided"}), 400
+    
+    # Create Job ID
+    job_id = str(uuid.uuid4())
+    JOBS[job_id] = {"status": "queued", "submitted_at": time.time()}
+    
+    # Start Background Thread
+    thread = threading.Thread(target=background_worker, args=(job_id, data['url']))
+    thread.daemon = True # Ensures thread doesn't block shutdown
+    thread.start()
+    
+    # Return INSTANTLY
+    return jsonify({
+        "status": "started",
+        "job_id": job_id,
+        "message": "Use GET /result/<job_id> to check status."
+    })
+
+@app.route('/result/<job_id>', methods=['GET'])
+def get_result(job_id):
+    job = JOBS.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    return jsonify(job)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
