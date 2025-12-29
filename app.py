@@ -8,7 +8,12 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 # --- CONFIGURATION ---
-API_KEY = "PASTE_YOUR_API_KEY_HERE"
+# Read the key from the Server's secure environment
+API_KEY = os.environ.get("GOOGLE_API_KEY")
+
+if not API_KEY:
+    raise ValueError("Error: GOOGLE_API_KEY is missing in Environment Variables!")
+
 genai.configure(api_key=API_KEY)
 
 def download_youtube_video(url, output_path):
@@ -95,3 +100,4 @@ def process_video():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
+
