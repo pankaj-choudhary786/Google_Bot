@@ -2,6 +2,7 @@ import os
 import time
 import uuid
 import threading
+import shutil
 import requests
 import google.generativeai as genai
 import yt_dlp
@@ -11,7 +12,8 @@ app = Flask(__name__)
 
 # --- CONFIGURATION ---
 API_KEY = os.environ.get("GOOGLE_API_KEY")
-COOKIES_FILE = "/etc/secrets/youtube_cookies.txt" # Render stores secret files here
+# The Read-Only source file from Render
+COOKIES_SOURCE = "/etc/secrets/youtube_cookies.txt" 
 
 # GLOBAL STORAGE
 JOBS = {} 
@@ -21,7 +23,6 @@ def get_model():
     if not API_KEY: return "models/gemini-1.5-flash"
     genai.configure(api_key=API_KEY)
     try:
-        # Silently pick the best available model without showing output
         available = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
         for m in available:
             if "flash" in m.lower() and "legacy" not in m.lower(): return m
@@ -30,18 +31,14 @@ def get_model():
         return "models/gemini-1.5-flash"
 
 # --- HELPER: DOWNLOADERS ---
-def download_youtube_video(url, output_path):
-    # Check if cookies exist
-    if not os.path.exists(COOKIES_FILE):
-        print("WARNING: Cookie file not found. YouTube download may fail.")
-
+def download_youtube_video(url, output_path, cookie_path):
     ydl_opts = {
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': output_path,
         'quiet': True,
         'no_warnings': True,
         'merge_output_format': 'mp4',
-        'cookiefile': COOKIES_FILE, # <--- THIS FIXES THE ERROR
+        'cookiefile': cookie_path,  # Use the WRITABLE copy
         'nocheckcertificate': True,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -56,23 +53,36 @@ def download_cloud_file(url, output_path):
 
 # --- BACKGROUND WORKER ---
 def background_worker(job_id, video_url):
-    local_path = f"temp_{job_id}.mp4"
+    local_video_path = f"temp_{job_id}.mp4"
+    local_cookie_path = f"cookies_{job_id}.txt" # Unique writable cookie file
+    
     JOBS[job_id]["status"] = "working"
     
     try:
         if not API_KEY: raise ValueError("Server configuration error")
 
-        # 1. Download
+        # 1. Setup Cookies (Copy from Read-Only to Writable)
+        use_cookies = False
+        if os.path.exists(COOKIES_SOURCE):
+            try:
+                shutil.copy(COOKIES_SOURCE, local_cookie_path)
+                use_cookies = True
+            except Exception as e:
+                print(f"Cookie copy failed: {e}")
+
+        # 2. Download
         if "youtube.com" in video_url or "youtu.be" in video_url:
-            download_youtube_video(video_url, local_path)
+            if not use_cookies:
+                raise ValueError("YouTube cookies missing on server")
+            download_youtube_video(video_url, local_video_path, local_cookie_path)
         else:
-            download_cloud_file(video_url, local_path)
+            download_cloud_file(video_url, local_video_path)
             
-        # 2. Upload
+        # 3. Upload
         genai.configure(api_key=API_KEY)
-        video_file = genai.upload_file(path=local_path)
+        video_file = genai.upload_file(path=local_video_path)
         
-        # 3. Wait
+        # 4. Wait
         while video_file.state.name == "PROCESSING":
             time.sleep(2)
             video_file = genai.get_file(video_file.name)
@@ -80,7 +90,7 @@ def background_worker(job_id, video_url):
         if video_file.state.name == "FAILED":
             raise ValueError("Processing failed")
 
-        # 4. Generate
+        # 5. Generate
         model = genai.GenerativeModel(model_name=get_model())
         
         prompt = (
@@ -92,21 +102,21 @@ def background_worker(job_id, video_url):
         
         response = model.generate_content([video_file, prompt])
         
-        # 5. Success
+        # 6. Success
         JOBS[job_id]["status"] = "completed"
         JOBS[job_id]["transcript"] = response.text
 
     except Exception as e:
         JOBS[job_id]["status"] = "failed"
-        # Simplify error message for user
-        error_msg = str(e)
-        if "Sign in" in error_msg:
-            error_msg = "YouTube Login Error: Please update youtube_cookies.txt in Render."
-        JOBS[job_id]["error"] = error_msg
+        JOBS[job_id]["error"] = str(e)
         
     finally:
-        if os.path.exists(local_path):
-            try: os.remove(local_path)
+        # Cleanup ALL temp files
+        if os.path.exists(local_video_path):
+            try: os.remove(local_video_path)
+            except: pass
+        if os.path.exists(local_cookie_path):
+            try: os.remove(local_cookie_path)
             except: pass
 
 # --- ENDPOINTS ---
@@ -123,7 +133,6 @@ def start_job():
     thread.daemon = True
     thread.start()
     
-    # CLEAN OUTPUT
     return jsonify({
         "status": "started",
         "id": job_id
@@ -135,12 +144,9 @@ def get_result(job_id):
     if not job:
         return jsonify({"error": "Not found"}), 404
     
-    # CLEAN OUTPUT (Only show what matters)
     response = {"status": job["status"]}
-    
     if "transcript" in job:
         response["transcript"] = job["transcript"]
-    
     if "error" in job:
         response["error"] = job["error"]
         
