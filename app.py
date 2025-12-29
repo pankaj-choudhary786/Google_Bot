@@ -12,40 +12,45 @@ app = Flask(__name__)
 # --- CONFIGURATION ---
 API_KEY = os.environ.get("GOOGLE_API_KEY")
 
-# GLOBAL STORAGE (In-Memory Database)
-# Warning: If server restarts, these jobs disappear.
+# GLOBAL STORAGE
 JOBS = {} 
 
-# --- HELPER: AUTO-DETECT MODEL ---
-def get_best_model():
-    if not API_KEY: return None
+# --- HELPER: AUTO-SELECT MODEL (Silent) ---
+def get_model_name():
+    if not API_KEY: return "models/gemini-1.5-flash"
     genai.configure(api_key=API_KEY)
     try:
-        # Prioritize Flash -> Pro -> Any
         available = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        # Prioritize Flash
         for m in available:
             if "flash" in m.lower() and "legacy" not in m.lower(): return m
+        # Fallback to Pro
         for m in available:
             if "pro" in m.lower() and "vision" not in m.lower(): return m
         return available[0] if available else "models/gemini-1.5-flash"
     except:
         return "models/gemini-1.5-flash"
 
-# --- HELPER: DOWNLOADERS ---
+# --- HELPER: DOWNLOADERS (Fixed for YouTube) ---
 def download_youtube_video(url, output_path):
-    print(f"-> Extracting YouTube: {url}")
+    # We use the 'android' client to bypass the "Sign in to confirm you're not a bot" error
     ydl_opts = {
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': output_path,
         'quiet': True,
         'no_warnings': True,
-        'merge_output_format': 'mp4'
+        'merge_output_format': 'mp4',
+        'nocheckcertificate': True,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'web']
+            }
+        }
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
 def download_cloud_file(url, output_path):
-    print(f"-> Downloading Cloud File: {url}")
     with requests.get(url, stream=True) as r:
         r.raise_for_status()
         with open(output_path, 'wb') as f:
@@ -55,10 +60,10 @@ def download_cloud_file(url, output_path):
 # --- BACKGROUND WORKER ---
 def background_worker(job_id, video_url):
     local_path = f"temp_{job_id}.mp4"
-    JOBS[job_id]["status"] = "processing"
+    JOBS[job_id]["status"] = "working"
     
     try:
-        if not API_KEY: raise ValueError("API Key missing")
+        if not API_KEY: raise ValueError("Server configuration error")
 
         # 1. Download
         if "youtube.com" in video_url or "youtu.be" in video_url:
@@ -68,20 +73,18 @@ def background_worker(job_id, video_url):
             
         # 2. Upload
         genai.configure(api_key=API_KEY)
-        print(f"[{job_id}] Uploading to Gemini...")
         video_file = genai.upload_file(path=local_path)
         
-        # 3. Wait for Processing
+        # 3. Wait
         while video_file.state.name == "PROCESSING":
             time.sleep(2)
             video_file = genai.get_file(video_file.name)
             
         if video_file.state.name == "FAILED":
-            raise ValueError(f"Google processing failed: {video_file.state.name}")
+            raise ValueError("Processing failed")
 
         # 4. Generate
-        print(f"[{job_id}] Generating transcript...")
-        model_name = get_best_model()
+        model_name = get_model_name()
         model = genai.GenerativeModel(model_name=model_name)
         
         prompt = (
@@ -96,16 +99,12 @@ def background_worker(job_id, video_url):
         # 5. Success
         JOBS[job_id]["status"] = "completed"
         JOBS[job_id]["transcript"] = response.text
-        JOBS[job_id]["model_used"] = model_name
-        print(f"[{job_id}] DONE!")
 
     except Exception as e:
-        print(f"[{job_id}] ERROR: {e}")
         JOBS[job_id]["status"] = "failed"
         JOBS[job_id]["error"] = str(e)
         
     finally:
-        # Cleanup
         if os.path.exists(local_path):
             try: os.remove(local_path)
             except: pass
@@ -117,28 +116,33 @@ def start_job():
     if not data or 'url' not in data:
         return jsonify({"error": "No url provided"}), 400
     
-    # Create Job ID
     job_id = str(uuid.uuid4())
-    JOBS[job_id] = {"status": "queued", "submitted_at": time.time()}
+    JOBS[job_id] = {"status": "queued"}
     
-    # Start Background Thread
     thread = threading.Thread(target=background_worker, args=(job_id, data['url']))
-    thread.daemon = True # Ensures thread doesn't block shutdown
+    thread.daemon = True
     thread.start()
     
-    # Return INSTANTLY
+    # Minimal response
     return jsonify({
         "status": "started",
-        "job_id": job_id,
-        "message": "Use GET /result/<job_id> to check status."
+        "id": job_id
     })
 
 @app.route('/result/<job_id>', methods=['GET'])
 def get_result(job_id):
     job = JOBS.get(job_id)
     if not job:
-        return jsonify({"error": "Job not found"}), 404
-    return jsonify(job)
+        return jsonify({"error": "Not found"}), 404
+    
+    # Minimal response
+    response = {"status": job["status"]}
+    if "transcript" in job:
+        response["transcript"] = job["transcript"]
+    if "error" in job:
+        response["error"] = job["error"]
+        
+    return jsonify(response)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
