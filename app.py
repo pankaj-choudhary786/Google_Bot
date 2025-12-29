@@ -8,21 +8,26 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 # --- CONFIGURATION ---
-# Read the key from the Server's secure environment
+# Get API Key from Render Environment
 API_KEY = os.environ.get("GOOGLE_API_KEY")
 
 if not API_KEY:
-    raise ValueError("Error: GOOGLE_API_KEY is missing in Environment Variables!")
+    # Fallback for testing if env var is missing (NOT RECOMMENDED FOR PROD)
+    print("WARNING: GOOGLE_API_KEY not found in env. Checking for hardcoded key...")
+    # API_KEY = "Paste_Key_Here_Only_If_Testing_Locally" 
 
-genai.configure(api_key=API_KEY)
+if API_KEY:
+    genai.configure(api_key=API_KEY)
 
 def download_youtube_video(url, output_path):
     print(f"-> Detected YouTube URL. Extracting...")
+    # yt-dlp options to ensure we get a compatible mp4 file
     ydl_opts = {
-        'format': 'best[ext=mp4]/best',  # Get best MP4
-        'outtmpl': output_path,          # Save to specific path
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'outtmpl': output_path,
         'quiet': True,
-        'no_warnings': True
+        'no_warnings': True,
+        'merge_output_format': 'mp4' # Requires ffmpeg (added in Dockerfile)
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
@@ -46,7 +51,10 @@ def process_video():
     local_path = os.path.join(os.getcwd(), local_filename)
     
     try:
-        # --- 1. SMART DOWNLOADER ---
+        if not API_KEY:
+            return jsonify({"error": "Server API Key is missing."}), 500
+
+        # --- 1. DOWNLOAD ---
         if "youtube.com" in video_url or "youtu.be" in video_url:
             download_youtube_video(video_url, local_path)
         else:
@@ -69,16 +77,20 @@ def process_video():
 
         # --- 4. GENERATE TRANSCRIPT ---
         print("-> Generating transcript...")
-        model = genai.GenerativeModel(model_name="gemini-1.5-flash")
+        
+        # FIX: Use the specific model version to avoid 404 errors
+        model = genai.GenerativeModel(model_name="gemini-1.5-flash-001")
         
         prompt = (
-            "generate a frame by frame and per second transcript of this video . "
-            "Show all expressions and every frame in the transcript with timestampts "
-            "of the per second transcript. if any dialouge is there in the video "
-            "speak by characters in the video then also add that in the transcript."
+            "Generate a frame by frame and per second transcript of this video. "
+            "Show all expressions and every frame in the transcript with timestamps "
+            "of the per second transcript."
         )
         
         response = model.generate_content([video_file, prompt])
+        
+        # Cleanup file from Google Cloud (Optional but good practice)
+        # genai.delete_file(video_file.name)
         
         return jsonify({
             "status": "success",
@@ -90,7 +102,6 @@ def process_video():
         return jsonify({"error": str(e)}), 500
         
     finally:
-        # Clean up local file to save space
         if os.path.exists(local_path):
             try:
                 os.remove(local_path)
@@ -100,4 +111,3 @@ def process_video():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
-
