@@ -5,8 +5,13 @@ import threading
 import requests
 import google.generativeai as genai
 from flask import Flask, request, jsonify
+from flask_cors import CORS  # <--- NEW IMPORT
 
 app = Flask(__name__)
+
+# --- FIX: ENABLE CORS FOR ALL ORIGINS ---
+# This tells the browser: "Accept requests from ANYWHERE (*)"
+CORS(app) 
 
 # --- CONFIGURATION ---
 API_KEY = os.environ.get("GOOGLE_API_KEY")
@@ -29,7 +34,6 @@ def get_model():
 # --- HELPER: CLOUD DOWNLOADER ---
 def download_cloud_file(url, output_path):
     print(f"-> Downloading from Cloud: {url}")
-    # User-Agent mimics a browser to avoid rejection from some cloud servers
     headers = {'User-Agent': 'Mozilla/5.0'}
     
     with requests.get(url, stream=True, headers=headers) as r:
@@ -68,7 +72,7 @@ def background_worker(job_id, video_url):
             "generate a frame by frame and per second detailed transcript of this video . "
             "Show all expressions and every frame in the transcript with timestampts "
             "of the per second transcript. if any dialouge is there in the video "
-            "speak by characters in the video then also add that in the transcript."
+            "speak by characters in the video then also add that in the transcript otherwise indicate (no dialouge) in every frame."
         )
         
         response = model.generate_content([video_file, prompt])
@@ -123,4 +127,3 @@ def get_result(job_id):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
-
